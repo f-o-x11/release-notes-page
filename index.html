@@ -1,0 +1,106 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Preview your release notes as a web page before you tag</title>
+<meta name="description" content="A small Python script that turns git log since the last tag into a release-notes page and publishes it to a link only after you say yes.">
+<style>body{font:17px/1.6 system-ui,sans-serif;max-width:44rem;margin:2.5rem auto;padding:0 1rem;color:#1d1d1f}pre{background:#f5f5f7;padding:1rem;overflow:auto;font-size:14px;border-radius:6px}code{font-size:.92em}h1{line-height:1.2}</style></head><body>
+<h1>Preview your release notes as a web page before you tag</h1>
+<p>Release notes usually get written in a hurry, right after the tag. A better habit is to look at what is actually going out first: every commit since the last tag, grouped into new features, fixes, speedups and docs, on one page you can send to a teammate and ask "anything missing?"</p>
+<p>This post walks through a single Python file (standard library only) that does that. It reads <code>git log &lt;last-tag&gt;..HEAD</code>, groups commits by their conventional-commit prefix, writes <code>notes.html</code>, and then <strong>asks you</strong> before putting it on a public link with <a href="https://deed.page">deed.page</a>. Nothing leaves your machine until you type <code>y</code>.</p>
+<h2>What it does</h2>
+<ul>
+<li>Finds the last tag with <code>git describe --tags --abbrev=0</code> and lists every non-merge commit since then.</li>
+<li>Sorts <code>feat:</code>, <code>fix:</code>, <code>perf:</code> and <code>docs:</code> commits into sections, and puts everything else under "Other". Commit subjects are HTML-escaped, so a subject like <code>handle &lt;stdin&gt;</code> shows up as text instead of breaking the page.</li>
+<li>Writes <code>notes.html</code> and stops to ask. Answer anything but <code>y</code> and nothing is uploaded.</li>
+<li>On yes, uploads the page with one HTTP PUT. The first anonymous upload returns an owner token; the script saves it to <code>~/.config/deed-page/token</code> with mode 600 and never prints it.</li>
+<li>Remembers the slug, so running it again after more commits updates the <em>same</em> URL instead of making a new one.</li>
+<li><code>--delete</code> takes the page down.</li>
+</ul>
+<h2>The script</h2>
+<pre><code>#!/usr/bin/env python3
+&quot;&quot;&quot;Turn `git log &lt;last-tag&gt;..HEAD` into a release-notes web page, and publish
+it to a public deed.page URL only after you type y.
+
+  python3 release_notes_page.py            # build notes.html, ask before publishing
+  python3 release_notes_page.py --delete   # take the page down again
+&quot;&quot;&quot;
+import html, json, os, pathlib, secrets, subprocess, sys, urllib.request
+
+CONF = pathlib.Path.home() / &quot;.config&quot; / &quot;deed-page&quot;
+API = &quot;https://deed.page/v1/sites&quot;
+GROUPS = [(&quot;feat&quot;, &quot;New&quot;), (&quot;fix&quot;, &quot;Fixed&quot;), (&quot;perf&quot;, &quot;Faster&quot;), (&quot;docs&quot;, &quot;Docs&quot;)]
+
+def git(*args):
+    return subprocess.run([&quot;git&quot;, *args], capture_output=True, text=True).stdout.strip()
+
+def build():
+    since = git(&quot;describe&quot;, &quot;--tags&quot;, &quot;--abbrev=0&quot;)
+    rng = f&quot;{since}..HEAD&quot; if since else &quot;HEAD&quot;
+    lines = git(&quot;log&quot;, rng, &quot;--no-merges&quot;, &quot;--pretty=%h\x1f%s&quot;).splitlines()
+    buckets = {label: [] for _, label in GROUPS}; buckets[&quot;Other&quot;] = []
+    for line in lines:
+        sha, subj = line.split(&quot;\x1f&quot;, 1)
+        kind = subj.split(&quot;:&quot;, 1)[0].split(&quot;(&quot;, 1)[0].lower()
+        label = dict(GROUPS).get(kind, &quot;Other&quot;)
+        text = subj.split(&quot;:&quot;, 1)[1].strip() if label != &quot;Other&quot; and &quot;:&quot; in subj else subj
+        buckets[label].append(f&quot;&lt;li&gt;{html.escape(text)} &lt;code&gt;{sha}&lt;/code&gt;&lt;/li&gt;&quot;)
+    repo = html.escape(pathlib.Path(git(&quot;rev-parse&quot;, &quot;--show-toplevel&quot;)).name)
+    title = f&quot;{repo}: changes since {html.escape(since) if since else &#x27;the first commit&#x27;}&quot;
+    body = &quot;&quot;.join(f&quot;&lt;h2&gt;{k}&lt;/h2&gt;&lt;ul&gt;{&#x27;&#x27;.join(v)}&lt;/ul&gt;&quot; for k, v in buckets.items() if v)
+    page = (f&quot;&lt;!doctype html&gt;&lt;meta charset=utf-8&gt;&lt;meta name=viewport content=&#x27;width=device-width&#x27;&gt;&quot;
+            f&quot;&lt;title&gt;{title}&lt;/title&gt;&lt;style&gt;body{{font:16px/1.5 system-ui;max-width:42rem;margin:2rem auto;padding:0 1rem}}&quot;
+            f&quot;code{{color:#666}}&lt;/style&gt;&lt;h1&gt;{title}&lt;/h1&gt;&lt;p&gt;{len(lines)} commits&lt;/p&gt;{body}&quot;)
+    pathlib.Path(&quot;notes.html&quot;).write_text(page)
+    return len(lines), title
+
+def request(method, url, data=None):
+    req = urllib.request.Request(url, data=data, method=method)
+    tok = os.environ.get(&quot;DEEDPAGE_TOKEN&quot;, &quot;&quot;)
+    if not tok and (CONF / &quot;token&quot;).exists():
+        tok = (CONF / &quot;token&quot;).read_text().strip()
+    if tok: req.add_header(&quot;Authorization&quot;, f&quot;Bearer {tok}&quot;)
+    if data: req.add_header(&quot;Content-Type&quot;, &quot;text/html&quot;)
+    with urllib.request.urlopen(req) as r:
+        return r.status, r.read().decode() or &quot;{}&quot;
+
+def main():
+    slug_file = CONF / &quot;release-notes-slug&quot;
+    if &quot;--delete&quot; in sys.argv:
+        slug = slug_file.read_text().strip()
+        print(request(&quot;DELETE&quot;, f&quot;{API}/{slug}&quot;)[0], &quot;deleted&quot;, slug); return
+    n, title = build()
+    print(f&quot;Wrote notes.html: {title} ({n} commits). Open it and check it first.&quot;)
+    if input(&quot;Publish notes.html to a public URL? Anyone with the link can read it. [y/N] &quot;).strip() != &quot;y&quot;:
+        print(&quot;Not published.&quot;); return
+    slug = slug_file.read_text().strip() if slug_file.exists() else f&quot;notes-{secrets.token_hex(4)}&quot;
+    status, raw = request(&quot;PUT&quot;, f&quot;{API}?slug={slug}&quot;, pathlib.Path(&quot;notes.html&quot;).read_bytes())
+    resp = json.loads(raw)
+    CONF.mkdir(parents=True, exist_ok=True); os.chmod(CONF, 0o700)
+    slug_file.write_text(slug)
+    if resp.get(&quot;token&quot;):  # first anonymous publish returns an owner token: keep it, never print it
+        (CONF / &quot;token&quot;).write_text(resp[&quot;token&quot;]); os.chmod(CONF / &quot;token&quot;, 0o600)
+    print(status, resp.get(&quot;url&quot;, f&quot;https://{slug}.deed.page/&quot;))
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h2>Running it</h2>
+<pre><code>$ python3 release_notes_page.py
+Wrote notes.html: demo: changes since v0.1.0 (5 commits). Open it and check it first.
+Publish notes.html to a public URL? Anyone with the link can read it. [y/N] y
+201 https://notes-xxxxxxxx.deed.page/
+
+$ git commit -m "fix: second fix"
+$ python3 release_notes_page.py      # same URL, now 6 commits
+...
+200 https://notes-xxxxxxxx.deed.page/
+
+$ python3 release_notes_page.py --delete
+200 deleted notes-xxxxxxxx</code></pre>
+<p>I ran exactly this against a throwaway repo: answering <code>n</code> uploaded nothing and created no config files, <code>y</code> returned 201 and the page was live, the second run returned 200 on the same URL with the new commit, and after <code>--delete</code> the URL returned 404.</p>
+<h2>Using it from a coding agent</h2>
+<p>If an agent is drafting your release notes, keep the same rule: let it build <code>notes.html</code>, show you the file and the address it is about to use, and only publish after you say yes. Keep the owner token in the config file or an environment variable (<code>DEEDPAGE_TOKEN</code>) rather than in the prompt. The <a href="https://github.com/f-o-x11/deed-page-skill">deed-page-skill</a> repo packages this ask-first flow for agents, and the full HTTP API is in the <a href="https://deed.page/docs">deed.page docs</a>.</p>
+<h2>Notes</h2>
+<ul><li>Anyone with the link can open the page, so don't publish notes for a private repo you can't share.</li>
+<li>If your team doesn't use conventional commits, everything lands under "Other", which is still a useful list.</li>
+<li>Want it on every release? Call it from your release script right before <code>git tag</code>, so the yes/no prompt becomes part of cutting a release.</li></ul>
+<p><small>Written by the deed.page team. The script is MIT licensed; copy it freely.</small></p>
+</body></html>
